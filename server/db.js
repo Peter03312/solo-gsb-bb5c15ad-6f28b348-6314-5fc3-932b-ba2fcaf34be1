@@ -119,11 +119,47 @@ function initSchema(d) {
     used_by TEXT NOT NULL DEFAULT ''
   );
 
+  -- 包装出货单：按批次把已贴用标签按卷分配给出货单（整单事务化，任一条件不满足即拒绝且不占数量）。
+  -- 单据只增不改：批次/放行后续更正、放行删除均不删除出货记录，仅置为“待评估”（PENDING_REVIEW，终态不自动恢复）。
+  CREATE TABLE IF NOT EXISTS shipments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    shipment_code TEXT NOT NULL UNIQUE,       -- 出货单号，如 SHIP-0001（出货事务内补发）
+    batch_id INTEGER REFERENCES batches(id) ON DELETE SET NULL, -- 批次可因更正删除，单据保留
+    batch_code TEXT NOT NULL DEFAULT '',      -- 批次编码快照
+    ship_qty INTEGER NOT NULL CHECK (ship_qty > 0), -- 正整数出货量（张）
+    allergen_set TEXT NOT NULL DEFAULT '[]',  -- 出货当时的过敏原集合快照（规范化排序 JSON）
+    status TEXT NOT NULL DEFAULT 'SHIPPED'
+      CHECK (status IN ('SHIPPED','PENDING_REVIEW')), -- 已出货 / 待评估（不自动恢复）
+    review_reason TEXT NOT NULL DEFAULT '',   -- 待评估原因（留痕）
+    shipped_at TEXT NOT NULL,
+    shipped_by TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+
+  -- 出货单分配明细：每条记录保存出货当时的放行标识、过敏原集合、卷号与修订号快照。
+  -- release_id 不加外键：放行删除后出货记录仍须保留其标识；卷不会被删除（仅停用）。
+  CREATE TABLE IF NOT EXISTS shipment_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    shipment_id INTEGER NOT NULL REFERENCES shipments(id),
+    roll_id INTEGER NOT NULL REFERENCES label_rolls(id),
+    roll_code TEXT NOT NULL DEFAULT '',       -- 卷号快照（如 LABEL-0001）
+    release_id INTEGER,                       -- 当时绑定的放行标识
+    release_at TEXT,                          -- 放行时间快照
+    release_by TEXT NOT NULL DEFAULT '',      -- 放行人快照
+    allergen_set TEXT NOT NULL DEFAULT '[]',  -- 当时卷（=批次推导=放行快照）过敏原集合
+    roll_revision INTEGER NOT NULL,           -- 当时卷的修订号
+    qty INTEGER NOT NULL CHECK (qty > 0)      -- 本卷分配张数（正整数）
+  );
+
   CREATE INDEX IF NOT EXISTS idx_events_time ON events(event_time, id);
   CREATE INDEX IF NOT EXISTS idx_process_inputs_event ON process_inputs(event_id);
   CREATE INDEX IF NOT EXISTS idx_releases_batch ON releases(batch_id);
   CREATE INDEX IF NOT EXISTS idx_label_rolls_batch ON label_rolls(batch_id);
   CREATE INDEX IF NOT EXISTS idx_label_usages_roll ON label_roll_usages(roll_id);
+  CREATE INDEX IF NOT EXISTS idx_shipments_batch ON shipments(batch_id);
+  CREATE INDEX IF NOT EXISTS idx_shipments_status ON shipments(status);
+  CREATE INDEX IF NOT EXISTS idx_shipment_items_shipment ON shipment_items(shipment_id);
+  CREATE INDEX IF NOT EXISTS idx_shipment_items_roll ON shipment_items(roll_id);
   `);
 }
 

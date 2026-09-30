@@ -105,6 +105,23 @@ function seedIfEmpty() {
             (?, '2026-09-30T13:40', 20, 2, 1, '包装工-赵强')`
   ).run(rollId, rollId);
 
+  // 演示出货单 SHIP-0001：从 LABEL-0001（修订号 2，已贴 120）分配 100 张。
+  // 出货当时保存放行标识、过敏原集合、卷号与修订号快照；该卷此时仍有 20 张已贴可出货。
+  const shipId = db.prepare(
+    `INSERT INTO shipments
+       (shipment_code, batch_id, batch_code, ship_qty, allergen_set,
+        status, review_reason, shipped_at, shipped_by)
+     VALUES ('', ?, 'BATCH-003', 100, ?, 'SHIPPED', '', '2026-09-30T14:20', '仓管-孙倩')`
+  ).run(batchIds['BATCH-003'], snapshot).lastInsertRowid;
+  db.prepare('UPDATE shipments SET shipment_code = ? WHERE id = ?')
+    .run(`SHIP-${String(shipId).padStart(4, '0')}`, shipId);
+  db.prepare(
+    `INSERT INTO shipment_items
+       (shipment_id, roll_id, roll_code, release_id, release_at, release_by,
+        allergen_set, roll_revision, qty)
+     VALUES (?, ?, 'LABEL-0001', ?, '2026-09-30T11:30', '质检员-王敏', ?, 2, 100)`
+  ).run(shipId, rollId, releaseId, snapshot);
+
   return true;
 }
 

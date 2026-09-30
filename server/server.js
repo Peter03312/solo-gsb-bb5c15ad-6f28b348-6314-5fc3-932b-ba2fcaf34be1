@@ -7,6 +7,7 @@ const { recompute, sortedJson } = require('./recompute');
 const { seedIfEmpty } = require('./seed');
 const replan = require('./replan');
 const labels = require('./labels');
+const shipments = require('./shipments');
 
 const PORT = parseInt(process.env.PORT || '3000', 10);
 const HOST = process.env.HOST || '0.0.0.0';
@@ -111,7 +112,9 @@ app.get('/api/state', (req, res) => {
 
   const label_rolls = db.prepare(
     `SELECT lr.*, b.code AS batch_code,
-            r.released_at AS release_at, r.released_by AS release_by
+            r.released_at AS release_at, r.released_by AS release_by,
+            COALESCE((SELECT SUM(qty) FROM shipment_items si WHERE si.roll_id = lr.id), 0)
+              AS allocated_qty
        FROM label_rolls lr
        LEFT JOIN batches b ON b.id = lr.batch_id
        LEFT JOIN releases r ON r.id = lr.release_id
@@ -120,10 +123,18 @@ app.get('/api/state', (req, res) => {
     ...labels.formatRoll(r),
     batch_code: r.batch_code,
     release_at: r.release_at,
-    release_by: r.release_by
+    release_by: r.release_by,
+    allocated_qty: r.allocated_qty || 0,
+    // 可出货余额：仅未停用卷的“已贴用 - 累计已分配”；停卷余量冻结不可出货。
+    shippable_qty: r.status === 'ACTIVE'
+      ? Math.max(r.applied_qty - (r.allocated_qty || 0), 0)
+      : 0
   }));
 
-  res.json({ materials, equipment, events, batches, label_rolls });
+  const shipment_rows = db.prepare('SELECT * FROM shipments ORDER BY id DESC').all();
+  const shipments_list = shipment_rows.map((s) => shipments.formatShipment(s, db));
+
+  res.json({ materials, equipment, events, batches, label_rolls, shipments: shipments_list });
 });
 
 // ---------- 通用：在事务中写事件集 -> 校验 -> 重算 ----------
@@ -141,7 +152,8 @@ function mutateEvents(fn) {
     return {
       ret,
       invalidated: recomputeResult.invalidated,
-      retired_rolls: recomputeResult.retiredRolls
+      retired_rolls: recomputeResult.retiredRolls,
+      pending_shipments: recomputeResult.pendingShipments
     };
   })();
   return result;
@@ -173,8 +185,8 @@ app.put('/api/materials/:id', (req, res) => {
     ).run(code, name, JSON.stringify(allergens), req.params.id);
     if (!info.changes) return res.status(404).json({ error: '原料不存在' });
     // 过敏原被修改会改变批次推导结果，需要全量重算
-    const { invalidated, retired_rolls } = mutateEvents(() => {});
-    res.json({ ok: true, invalidated, retired_rolls });
+    const { invalidated, retired_rolls, pending_shipments } = mutateEvents(() => {});
+    res.json({ ok: true, invalidated, retired_rolls, pending_shipments });
   } catch (err) { badRequest(res, err); }
 });
 
@@ -248,7 +260,7 @@ function normalizeEquipment(body) {
 app.post('/api/events', (req, res) => {
   try {
     const body = normalizeEventBody(req.body);
-    const { ret, invalidated, retired_rolls } = mutateEvents((d) => {
+    const { ret, invalidated, retired_rolls, pending_shipments } = mutateEvents((d) => {
       let batchId = null;
       if (body.type === 'PROCESS') {
         batchId = d.prepare('INSERT INTO batches (code) VALUES (?)')
@@ -269,7 +281,7 @@ app.post('/api/events', (req, res) => {
       }
       return eid;
     });
-    res.json({ id: ret, invalidated, retired_rolls });
+    res.json({ id: ret, invalidated, retired_rolls, pending_shipments });
   } catch (err) { badRequest(res, err); }
 });
 
@@ -282,7 +294,7 @@ app.put('/api/events/:id', (req, res) => {
     if (body.type !== existing.type) {
       return res.status(400).json({ error: '事件类型（加工/清洗）不可变更，请删除后新建' });
     }
-    const { invalidated, retired_rolls } = mutateEvents((d) => {
+    const { invalidated, retired_rolls, pending_shipments } = mutateEvents((d) => {
       if (body.type === 'PROCESS') {
         d.prepare('UPDATE batches SET code=? WHERE id=?')
           .run(body.batch_code, existing.batch_id);
@@ -300,7 +312,7 @@ app.put('/api/events/:id', (req, res) => {
         'UPDATE events SET event_time=?, equipment_id=?, note=? WHERE id=?'
       ).run(body.event_time, body.equipment_id, body.note, existing.id);
     });
-    res.json({ ok: true, invalidated, retired_rolls });
+    res.json({ ok: true, invalidated, retired_rolls, pending_shipments });
   } catch (err) { badRequest(res, err); }
 });
 
@@ -310,7 +322,7 @@ app.delete('/api/events/:id', (req, res) => {
       'SELECT ev.id, ev.type, ev.batch_id, b.code AS batch_code FROM events ev LEFT JOIN batches b ON b.id = ev.batch_id WHERE ev.id=?'
     ).get(req.params.id);
     if (!existing) return res.status(404).json({ error: '事件不存在' });
-    const { invalidated, retired_rolls } = mutateEvents((d) => {
+    const { invalidated, retired_rolls, pending_shipments } = mutateEvents((d) => {
       if (existing.type === 'PROCESS' && existing.batch_id) {
         const referenced = d.prepare(
           'SELECT COUNT(*) AS c FROM process_inputs WHERE batch_id=?'
@@ -326,12 +338,15 @@ app.delete('/api/events/:id', (req, res) => {
         }
         // 兜底：批次连带删除时，其名下仍有效的标签卷永久停用（通常不会走到，因放行需先删）
         labels.deactivateForBatchDeletion(d, existing.batch_id, existing.batch_code);
+        // 批次行将被删除（出货单 batch_id ON DELETE SET NULL，记录保留）；
+        // 停卷后同步把相关出货单置为待评估。
+        shipments.markPendingForRetirement(d);
         d.prepare('DELETE FROM batch_outputs WHERE batch_id=?').run(existing.batch_id);
         d.prepare('DELETE FROM batches WHERE id=?').run(existing.batch_id);
       }
       d.prepare('DELETE FROM events WHERE id=?').run(existing.id);
     });
-    res.json({ ok: true, invalidated, retired_rolls });
+    res.json({ ok: true, invalidated, retired_rolls, pending_shipments });
   } catch (err) { badRequest(res, err); }
 });
 
@@ -389,13 +404,18 @@ app.post('/api/releases', (req, res) => {
 app.delete('/api/releases/:id', (req, res) => {
   const rel = db.prepare('SELECT id FROM releases WHERE id=?').get(req.params.id);
   if (!rel) return res.status(404).json({ error: '放行记录不存在' });
-  // 放行删除：其名下仍有效的标签卷先永久停用（字段/响应形状保持 ok:true 不变，附加 retired_rolls）
-  const { rolls, reason } = labels.deactivateForReleaseDeletion(db, rel.id);
-  db.prepare('DELETE FROM releases WHERE id=?').run(rel.id);
-  res.json({
-    ok: true,
-    retired_rolls: rolls.map((x) => ({ id: x.id, roll_code: x.roll_code, reason }))
-  });
+  // 放行删除：其名下仍有效的标签卷先永久停用，再把相关出货单置为待评估（同一事务原子完成）。
+  // 字段/响应形状保持 ok:true 不变，附加 retired_rolls 与 pending_shipments；
+  // 出货明细中的放行标识（release_id/release_at/release_by 快照）保留不删。
+  let retired = [];
+  let pending = [];
+  db.transaction(() => {
+    const { rolls, reason } = labels.deactivateForReleaseDeletion(db, rel.id);
+    retired = rolls.map((x) => ({ id: x.id, roll_code: x.roll_code, reason }));
+    pending = shipments.markPendingForRetirement(db);
+    db.prepare('DELETE FROM releases WHERE id=?').run(rel.id);
+  })();
+  res.json({ ok: true, retired_rolls: retired, pending_shipments: pending });
 });
 
 // ---------- 过敏原标签卷 ----------
@@ -422,6 +442,82 @@ function sendLabelError(res, err) {
     const status = (err.code === 'REVISION_MISMATCH' || err.code === 'OVER_LIMIT' ||
       err.code === 'ROLL_RETIRED') ? 409 : 400;
     if (err.code === 'ROLL_NOT_FOUND') return res.status(404).json({ error: err.message, code: err.code });
+    return res.status(status).json({
+      error: err.message,
+      code: err.code,
+      details: err.details
+    });
+  }
+  console.error(err);
+  return res.status(500).json({ error: err && err.message ? err.message : '服务器内部错误' });
+}
+
+// ---------- 包装出货 ----------
+// 出货确认：body { batch_id, ship_qty, shipped_by?, shipped_at?,
+//                  allocations:[{ roll_id, qty }] }
+// 任一条件不满足（卷不属于该批次 / 卷已停用 / 放行失效或删除 / 分配和≠出货量 /
+// 累计分配超已贴用）整单事务回滚，不占用任何数量。
+app.post('/api/shipments', (req, res) => {
+  try {
+    res.json(shipments.createShipment(db, req.body || {}));
+  } catch (err) { sendShipmentError(res, err); }
+});
+
+// 出货单列表：?batch_id=、?status=SHIPPED|PENDING_REVIEW（均可选）
+app.get('/api/shipments', (req, res) => {
+  try {
+    const status = req.query.status ? String(req.query.status).toUpperCase() : null;
+    if (status && status !== 'SHIPPED' && status !== 'PENDING_REVIEW') {
+      return res.status(400).json({
+        error: 'status 仅支持 SHIPPED 或 PENDING_REVIEW',
+        code: 'INVALID_REQUEST'
+      });
+    }
+    let batch_id = null;
+    if (req.query.batch_id !== undefined) {
+      batch_id = parseInt(req.query.batch_id, 10);
+      if (!Number.isInteger(batch_id)) {
+        return res.status(400).json({ error: 'batch_id 不合法', code: 'INVALID_REQUEST' });
+      }
+    }
+    res.json(shipments.listShipments(db, { batch_id, status }));
+  } catch (err) { sendShipmentError(res, err); }
+});
+
+// 单张出货单：/api/shipments/:idOrCode（数字 id 或 SHIP-0001 卷式单号）
+app.get('/api/shipments/:idOrCode', (req, res) => {
+  const key = String(req.params.idOrCode || '').trim();
+  let s = null;
+  if (/^\d+$/.test(key)) s = shipments.getShipment(db, parseInt(key, 10));
+  else s = shipments.getShipmentByCode(db, key);
+  if (!s) return res.status(404).json({ error: '出货单不存在', code: 'SHIPMENT_NOT_FOUND' });
+  res.json(s);
+});
+
+// 批次可出货余额：/api/batches/:id/shipment-balance
+// 可出货余额 = 该批次所有未停用卷 max(已贴用 - 累计已分配,0) 之和。
+app.get('/api/batches/:id/shipment-balance', (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  if (!Number.isInteger(id)) {
+    return res.status(400).json({ error: '批次 id 不合法', code: 'INVALID_REQUEST' });
+  }
+  try {
+    res.json(shipments.batchBalance(db, id));
+  } catch (err) { sendShipmentError(res, err); }
+});
+
+// 全部批次可出货余额
+app.get('/api/shipment-balances', (req, res) => {
+  res.json(shipments.allBalances(db));
+});
+
+function sendShipmentError(res, err) {
+  if (err && err.name === 'ShipmentError') {
+    if (err.code === 'ROLL_NOT_FOUND' || err.code === 'SHIPMENT_NOT_FOUND') {
+      return res.status(404).json({ error: err.message, code: err.code, details: err.details });
+    }
+    const status = (err.code === 'ROLL_RETIRED' || err.code === 'RELEASE_INACTIVE' ||
+      err.code === 'OVER_APPLIED') ? 409 : 400;
     return res.status(status).json({
       error: err.message,
       code: err.code,

@@ -200,3 +200,43 @@ details summary { cursor: pointer; color: var(--primary); font-size: 12.5px; mar
 .roll-retired-reason { color: var(--danger); font-size: 12.5px; font-weight: 600; margin-bottom: 4px; }
 
 @media (max-width: 860px) { .base-grid { grid-template-columns: 1fr; } }
+
+/* ---------- 包装出货 ---------- */
+.sub-head { margin: 18px 0 8px; font-size: 15px; color: #2b3c50; }
+.balance-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 10px; }
+.balance-card {
+  border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; background: #fbfcfd;
+  cursor: pointer; transition: border-color .15s, background .15s;
+}
+.balance-card:hover { border-color: #9db4c9; background: #f4f8fc; }
+.balance-card.zero { opacity: .85; }
+.balance-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 6px; }
+.balance-nums { display: flex; gap: 12px; font-size: 12.5px; color: var(--muted); flex-wrap: wrap; }
+.balance-nums b { color: #2b3c50; font-variant-numeric: tabular-nums; }
+.balance-nums .ok-num { color: var(--ok); }
+.balance-rolls { margin-top: 6px; display: flex; flex-wrap: wrap; gap: 6px; }
+.mini-roll {
+  font-size: 11.5px; border: 1px solid var(--line); border-radius: 999px;
+  padding: 1px 9px; background: #fff; color: #33475b; white-space: nowrap;
+}
+.mini-roll.off { color: var(--danger); border-color: #e3b3ac; background: var(--danger-bg); }
+.shipment-list { display: flex; flex-direction: column; gap: 12px; }
+.shipment-card { border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; background: #fff; }
+.shipment-card.pending { border-color: #e0b35a; background: #fdfaf2; }
+.shipment-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.shipment-code { font-weight: 700; font-size: 15px; color: #1f3245; }
+.item-table { margin-top: 6px; font-size: 12.5px; }
+.item-table th, .item-table td { padding: 5px 8px; }
+.shipment-review-reason {
+  margin-top: 8px; color: #8a5d00; font-size: 12.5px; font-weight: 600;
+  background: #fbf1d6; border: 1px solid #e8d29a; border-radius: 8px; padding: 7px 10px;
+}
+.ship-rolls-hint { display: flex; flex-direction: column; gap: 6px; margin-bottom: 6px; }
+#shipAllocations { display: flex; flex-direction: column; gap: 8px; }
+.alloc-line {
+  display: flex; align-items: center; gap: 10px; border: 1px solid var(--line);
+  border-radius: 8px; padding: 6px 10px; background: #fbfcfd;
+}
+.alloc-roll { min-width: 110px; font-weight: 600; font-size: 13px; }
+.alloc-qty { width: 110px; padding: 5px 8px; border: 1px solid #cdd7e0; border-radius: 6px; }
+.notice.warn { background: #fbf1d6; border: 1px solid #e8d29a; color: #8a5d00; }

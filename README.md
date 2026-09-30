@@ -2,7 +2,8 @@
 
 本地运行的食品加工过敏原追溯网页：录入**原料过敏原、设备、按时间排序的加工事件与已核实清洗事件**，
 系统按时间顺序推导每个产出批次的过敏原集合及来源路径，管理设备残留，支持按**当时推导结果**登记批次放行，
-并在**包装前按批次 + 有效放行登记过敏原标签卷**（按修订号核销贴用/作废，集合或放行变化时永久停用）。
+并在**包装前按批次 + 有效放行登记过敏原标签卷**（按修订号核销贴用/作废，集合或放行变化时永久停用），
+**包装出货时按批次把已贴用标签卷分配给出货单**（整单事务校验，卷停用时相关已出货单转待评估、不自动恢复）。
 
 - 后端：Node.js + Express
 - 数据库：SQLite（[better-sqlite3](https://github.com/WiseLibs/better-sqlite3)，数据文件本地保存）
@@ -156,7 +157,7 @@ curl -s -X POST http://localhost:3000/api/replan/apply \
 | --- | --- |
 | `POST /api/label-rolls` | 登记一卷（三方一致校验），返回卷对象（含 `roll_code`、`remaining_qty`） |
 | `POST /api/label-rolls/:id/consume` | 按预期修订号核销贴用/作废，返回更新后的卷对象（含新 `revision`） |
-| `GET /api/state` | 顶层新增 `label_rolls` 数组（既有字段不变），按批次含卷号/印量/贴用/作废/剩余/修订号/状态/停用原因 |
+| `GET /api/state` | 顶层含 `label_rolls` 数组（既有字段不变），按批次含卷号/印量/贴用/作废/剩余/修订号/状态/停用原因；每项另含 `allocated_qty`/`shippable_qty`，顶层另含 `shipments`（见下节） |
 | `DELETE /api/releases/:id` | 语义不变（仍返回 `ok:true`），另附 `retired_rolls`：其名下有效卷被永久停用 |
 | 事件 `POST/PUT/DELETE`、原料 `PUT` | 响应形状不变，另附 `retired_rolls`（本次重算导致停用的卷） |
 
@@ -225,6 +226,125 @@ curl -s -X DELETE http://localhost:3000/api/releases/1
 | 核销：负数、全零、缺少修订号、卷号不合法 | 400 | `INVALID_REQUEST` |
 | 核销不存在的卷 | 404 | `ROLL_NOT_FOUND` |
 
+## 包装出货（按批次把已贴用标签分配给出货单）
+
+包装出货时，按**批次**把若干**已贴用标签卷**的张数一次性分配给一张出货单：
+
+- 出货确认必须录入：**批次**、**正整数出货量（张）**、**各卷分配张数**与**操作人**（出货时间可选，默认当前）。
+- 每个被分配的卷必须同时满足：
+  1. **属于该批次**；
+  2. **未停用**（仍为 `ACTIVE`，未因集合改变 / 放行失效或删除而永久停用）；
+  3. **绑定有效放行**（其放行记录仍存在且为 `ACTIVE`）。
+- 各卷分配张数之和**必须恰好等于出货量**；每卷**累计已分配数 + 本次分配不得超过该卷已贴用数**（作废张数不算贴用）。
+- **任一条件不满足，整单拒绝并事务回滚、不占用任何数量**（哪怕其中一卷合法，另一卷超量也全部回滚）。
+- 成功返回**出货单号**（`SHIP-0001` 起）与**状态**（`SHIPPED` 已出货）；
+  每条分配明细都保存出货**当时的放行标识（release_id 及放行时间/人快照）、过敏原集合、卷号与修订号**。
+- **出货记录不可因后续更正消失**：批次行被连带删除时单据保留（批次置空、编码快照保留）；
+  放行被删除时，明细里的放行标识与放行快照仍保留。
+- **待评估（终态，不自动恢复）**：原料或事件变更、整组换线确认应用、或放行删除导致某卷停用时，
+  **分配过该卷的已出货单全部标记为 `PENDING_REVIEW`（待评估）并显示逐卷原因**；
+  即使过敏原集合后来恢复一致，单据**也不会自动恢复**为已出货（需线下质量评估，系统不提供自动回改）。
+- 卷停用后，其**尚未分配的已贴张数也不得再出货**（出货只接受 `ACTIVE` 卷，余额查询中停卷可出货恒为 0）。
+- 可查询**批次可出货余额**（该批所有未停用卷的「已贴用 − 累计已分配」之和）与**出货单状态/明细**。
+- 已出货/待评估单据占用的分配数量始终计入「累计已分配」，不会因单据转待评估而退回重复使用。
+
+### HTTP API
+
+| 方法与路径 | 说明 |
+| --- | --- |
+| `POST /api/shipments` | 出货确认（整单事务化），返回出货单（含 `shipment_code`、`status`、各卷快照 `items`） |
+| `GET /api/shipments` | 出货单列表，可按 `?batch_id=`、`?status=SHIPPED|PENDING_REVIEW` 过滤 |
+| `GET /api/shipments/:idOrCode` | 单张出货单（数字 id 或 `SHIP-0001` 单号），含状态、原因与明细快照 |
+| `GET /api/batches/:id/shipment-balance` | 单个批次可出货余额（逐卷列出 印量/已贴/作废/已分配/可出） |
+| `GET /api/shipment-balances` | 全部批次可出货余额 |
+| `GET /api/state` | 顶层新增 `shipments` 数组；`label_rolls` 每项另含 `allocated_qty`（累计已分配）与 `shippable_qty`（可出货余额） |
+| 事件 `POST/PUT/DELETE`、原料 `PUT`、换线 `apply`、放行 `DELETE` | 响应形状不变，另附 `pending_shipments`（本次新转入待评估的出货单） |
+| 换线 `preview` 的 `diff` | 另含 `shipments_will_pending`（应用后将转待评估的出货单）与 `summary.shipments_will_pending` |
+
+出货请求体：
+
+```json
+{ "batch_id": 3, "ship_qty": 120, "shipped_by": "仓管-周杰",
+  "shipped_at": "2026-09-30T14:20",
+  "allocations": [
+    { "roll_id": 1, "qty": 100 },
+    { "roll_id": 2, "qty": 20 }
+  ] }
+```
+
+`items[]` 明细快照字段：`roll_id` / `roll_code`（当时卷号）、`release_id`（当时放行标识）、
+`release_at` / `release_by`（放行快照）、`allergens`（当时过敏原集合）、
+`roll_revision`（当时卷修订号）、`qty`（本卷分配张数）。
+
+#### 调用示例（curl，基于演示数据）
+
+演示库自带 `BATCH-003` 的一卷 `LABEL-0001`：印 500 / 贴 120 / 作废 5 / 剩 375，
+以及一张演示出货单 `SHIP-0001`（从该卷分配 100 张，修订号 2）。因此该卷**可出货余额 = 120 − 100 = 20**。
+
+```bash
+# 1) 查询批次可出货余额（逐卷：已贴/已分配/可出）
+curl -s http://localhost:3000/api/batches/3/shipment-balance
+# -> { batch_id:3, batch_code:"BATCH-003", shippable_qty:20,
+#      applied_qty:120, allocated_qty:100,
+#      rolls:[{ roll_code:"LABEL-0001", status:"ACTIVE",
+#               applied_qty:120, allocated_qty:100, available_qty:20, ... }] }
+
+# 2) 出货确认：把剩余 20 张分配给一张出货单（整单事务）
+curl -s -X POST http://localhost:3000/api/shipments \
+  -H 'Content-Type: application/json' -d '{
+    "batch_id": 3, "ship_qty": 20, "shipped_by": "仓管-周杰",
+    "allocations": [ { "roll_id": 1, "qty": 20 } ]
+  }'
+# -> { shipment_code:"SHIP-0002", status:"SHIPPED", ship_qty:20, allocated_qty:20,
+#      allergens:["蛋","乳","芝麻"],
+#      items:[{ roll_code:"LABEL-0001", release_id:1,
+#               release_at:"2026-09-30T11:30", release_by:"质检员-王敏",
+#               allergens:["蛋","乳","芝麻"], roll_revision:2, qty:20 }] }
+
+# 3) 余额已为 0，再分配 → 409 OVER_APPLIED，整单拒绝、不占用
+curl -s -X POST http://localhost:3000/api/shipments \
+  -H 'Content-Type: application/json' -d '{
+    "batch_id": 3, "ship_qty": 1, "shipped_by": "仓管-周杰",
+    "allocations": [ { "roll_id": 1, "qty": 1 } ]
+  }'
+# -> { error:"卷 LABEL-0001 可出货（已贴用）120 张，此前累计已分配 120 张，本次再分配 1 张后为 121 张，超过已贴用数；整单拒绝、不占用数量",
+#      code:"OVER_APPLIED" }
+
+# 4) 各卷之和 ≠ 出货量 → 400 ALLOCATION_MISMATCH（同样不占用）
+curl -s -X POST http://localhost:3000/api/shipments \
+  -H 'Content-Type: application/json' -d '{
+    "batch_id": 3, "ship_qty": 21, "shipped_by": "周杰",
+    "allocations": [ { "roll_id": 1, "qty": 20 } ]
+  }'
+
+# 5) 查询出货单状态：按单号 / 按状态 / 按批次
+curl -s http://localhost:3000/api/shipments/SHIP-0001
+curl -s 'http://localhost:3000/api/shipments?status=PENDING_REVIEW'
+curl -s 'http://localhost:3000/api/shipments?batch_id=3'
+
+# 6) 原料/事件变更或删除放行导致卷停用后：相关已出货单 PENDING_REVIEW（不自动恢复）
+#    例如到“事件时间线”给 BATCH-002 加入花生原料（经设备残留/引用传播到 BATCH-003），
+#    事件更正响应会附 pending_shipments；再查 SHIP-0001：
+curl -s http://localhost:3000/api/shipments/SHIP-0001
+# -> { status:"PENDING_REVIEW", pending_review:true,
+#      review_reason:"出货所用标签卷已停用，相关已出货标签需质量评估：卷 LABEL-0001：批次过敏原集合已改变（新增：花生）…",
+#      items:[ ...快照仍在... ] }
+# 该卷尚未分配的已贴张数此时余额为 0，不可再出货；撤销改动集合恢复后单据仍为 PENDING_REVIEW。
+```
+
+| 场景 | HTTP | `code` |
+| --- | --- | --- |
+| 缺批次 / 出货量或分配张数非正整数 / 缺操作人 / 空分配 / 同一卷重复分配 / 出货时间格式错 | 400 | `INVALID_REQUEST` |
+| 批次不存在（出货 / 余额查询） | 400 | `BATCH_NOT_FOUND` |
+| 卷不属于该批次 | 400 | `ROLL_BATCH_MISMATCH` |
+| 各卷分配之和 ≠ 出货量 | 400 | `ALLOCATION_MISMATCH` |
+| 卷已停用（含其未分配已贴张数再出货） | 409 | `ROLL_RETIRED` |
+| 卷绑定的放行已失效 / 已删除 | 409 | `RELEASE_INACTIVE` |
+| 某卷累计已分配将超过已贴用数 | 409 | `OVER_APPLIED` |
+| 被分配的卷不存在 | 404 | `ROLL_NOT_FOUND` |
+| 出货单不存在（按 id / 单号查询） | 404 | `SHIPMENT_NOT_FOUND` |
+| 列表 `status` 取值非法 | 400 | `INVALID_REQUEST` |
+
 ## 一键启动（Docker，从空环境开始）
 
 要求安装 Docker 与 Docker Compose（v2）。在项目目录执行：
@@ -261,6 +381,7 @@ npm start                      # 自动创建 data/allergen.db、建表并写入
 npm test             # 校验引擎：无环/成环用例
 npm run test:replan  # 启动临时端口的真实服务，端到端验证整组预演/确认应用全部语义
 npm run test:labels  # 启动临时端口的真实服务，端到端验证标签卷登记/核销/永久停用全部语义
+npm run test:shipments # 端到端验证包装出货：余额、整单事务拒绝、快照、待评估联动与换线预测
 ```
 
 ## 访问地址与端口
@@ -293,6 +414,10 @@ npm run test:labels  # 启动临时端口的真实服务，端到端验证标签
 - **过敏原标签卷**：按批次分组展示每卷印量、贴用、作废、剩余及当前修订号；
   可在此包装前登记新卷、按修订号核销贴用/作废；停用卷红色标注并给出具体停用原因，
   已贴数量标注“待复核”、余量标注“冻结”。
+- **包装出货**：展示各批次**可出货余额**（未停用卷的「已贴用 − 累计已分配」，点击卡片即可出货）；
+  可在此录入批次、正整数出货量、各卷分配张数与操作人做整单出货确认（失败整单拒绝、不占数量），
+  并列出全部出货单及其状态、逐卷明细快照（放行标识 / 过敏原 / 卷号 / 修订号）；
+  **待评估**单据黄色标注并给出逐卷停用原因，不自动恢复。
 - **事件时间线**：按时间排列全部加工/清洗事件，展示输入、引用批次与推导结果；
   “更正”可修改早期事件，保存时整单校验并触发重算。
 - **原料与设备**：维护原料档案（编码、名称、过敏原标签）与设备档案。
@@ -314,16 +439,18 @@ npm run test:labels  # 启动临时端口的真实服务，端到端验证标签
 server/
   db.js          # SQLite 连接与表结构（导出 initSchema 供内存影子库复用）
   validation.js  # 全量校验（未来批次/循环/时间冲突/重复产出）
-  recompute.js   # 推导引擎：回放事件、批次并集、设备残留、放行核对、标签卷停用核对
+  recompute.js   # 推导引擎：回放事件、批次并集、设备残留、放行核对、标签卷停用核对、出货单待评估核对
   labels.js      # 过敏原标签卷：三方一致登记、按修订号核销、永久停用
+  shipments.js   # 包装出货：整单事务分配、快照保存、可出货余额、待评估联动（不自动恢复）
   replan.js      # 整组换线：影子库预演、业务版本签名令牌、事务确认应用
-  seed.js        # 首次启动演示数据（含一卷演示标签卷）
-  server.js      # Express API 与静态页面（含 /api/label-rolls、/api/replan/preview|apply）
+  seed.js        # 首次启动演示数据（含一卷演示标签卷与一张演示出货单）
+  server.js      # Express API 与静态页面（含 /api/label-rolls、/api/shipments、/api/replan/preview|apply）
 public/
   index.html  styles.css  app.js
 scripts/
-  test-cycle.js    # 校验引擎单测
-  test-replan.js   # 整组预演/确认应用端到端测试
-  test-labels.js   # 标签卷登记/核销/停用端到端测试
+  test-cycle.js      # 校验引擎单测
+  test-replan.js     # 整组预演/确认应用端到端测试
+  test-labels.js     # 标签卷登记/核销/停用端到端测试
+  test-shipments.js  # 包装出货：余额/整单事务/快照/待评估联动端到端测试
 Dockerfile  docker-compose.yml
 ```

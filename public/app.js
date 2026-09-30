@@ -1,6 +1,6 @@
 'use strict';
 
-let state = { materials: [], equipment: [], events: [], batches: [], label_rolls: [] };
+let state = { materials: [], equipment: [], events: [], batches: [], label_rolls: [], shipments: [] };
 let editingEventId = null;
 
 const $ = (sel) => document.querySelector(sel);
@@ -61,12 +61,21 @@ function reportRetiredRolls(list) {
   }
 }
 
+function reportPendingShipments(list) {
+  if (Array.isArray(list) && list.length) {
+    notice('warn', `${list.length} 张出货单需质量评估（待评估，不自动恢复）`,
+      list.map((s) => `${s.shipment_code || ('出货单#' + s.id)}：${s.review_reason}`));
+  }
+}
+
 // ================= 渲染 =================
 async function refresh() {
   state = await api('/api/state');
   renderResidue();
   renderBatches();
   renderRolls();
+  renderBalances();
+  renderShipments();
   renderEvents();
   renderBase();
 }
@@ -209,6 +218,89 @@ function renderRollCard(r) {
       <div class="roll-retired-reason">⛔ 停用原因：${esc(r.retired_reason || '—')}</div>
       <div class="batch-meta">已贴 ${r.applied_qty} 张已标记待复核；即使集合后来恢复，本卷也不会自动解冻。</div>`}
   </div>`;
+}
+
+// ================= 包装出货：余额与出货单 =================
+function renderBalances() {
+  const byBatch = new Map();
+  for (const b of state.batches) byBatch.set(b.id, []);
+  for (const r of state.label_rolls || []) {
+    if (r.batch_id != null && byBatch.has(r.batch_id)) byBatch.get(r.batch_id).push(r);
+  }
+
+  const cards = state.batches.map((b) => {
+    const rolls = byBatch.get(b.id) || [];
+    const shippable = rolls
+      .filter((r) => r.active)
+      .reduce((s, r) => s + Math.max(r.applied_qty - (r.allocated_qty || 0), 0), 0);
+    const applied = rolls.reduce((s, r) => s + r.applied_qty, 0);
+    const allocated = rolls.reduce((s, r) => s + (r.allocated_qty || 0), 0);
+    const canShip = shippable > 0;
+    return `
+    <div class="balance-card ${canShip ? '' : 'zero'}" onclick="openShipment(${b.id})">
+      <div class="balance-head">
+        <span class="batch-code">${esc(b.code)}</span>
+        <span class="badge ${canShip ? 'active' : 'invalid'}">可出货 ${shippable}</span>
+      </div>
+      <div class="balance-nums">
+        <span>已贴用 <b>${applied}</b></span>
+        <span>已分配 <b>${allocated}</b></span>
+        <span>可出货 <b class="${canShip ? 'ok-num' : ''}">${shippable}</b></span>
+      </div>
+      <div class="balance-rolls">
+        ${rolls.length ? rolls.map((r) => {
+          const avail = r.active ? Math.max(r.applied_qty - (r.allocated_qty || 0), 0) : 0;
+          return `<span class="mini-roll ${r.active ? '' : 'off'}">
+            ${esc(r.roll_code)}：${r.active ? `可出 ${avail}` : '已停用'}</span>`;
+        }).join(' ') : '<span class="batch-meta">无标签卷</span>'}
+      </div>
+    </div>`;
+  }).join('');
+
+  $('#balanceList').innerHTML = cards || '<div class="batch-meta">尚无批次。</div>';
+}
+
+function renderShipments() {
+  const list = state.shipments || [];
+  if (!list.length) {
+    $('#shipmentList').innerHTML = '<div class="batch-meta">尚无出货单。</div>';
+    return;
+  }
+  $('#shipmentList').innerHTML = list.map((s) => `
+    <div class="shipment-card ${s.status === 'PENDING_REVIEW' ? 'pending' : ''}">
+      <div class="shipment-head">
+        <span class="shipment-code">${esc(s.shipment_code)}</span>
+        <span class="badge ${s.status === 'SHIPPED' ? 'active' : 'invalid'}">
+          ${s.status === 'SHIPPED' ? '已出货' : '待评估'}
+        </span>
+        <span class="batch-meta">批次 ${esc(s.batch_code || '（已删除）')} ·
+          ${esc(fmtTime(s.shipped_at))} · ${esc(s.shipped_by)}</span>
+        <span class="spacer"></span>
+        <span class="batch-meta">出货量 <b>${s.ship_qty}</b> 张</span>
+      </div>
+      <div class="tag-row" style="margin:6px 0">
+        <b class="batch-meta">出货时过敏原：</b>${allergenTags(s.allergens, '无过敏原')}
+      </div>
+      <table class="grid item-table">
+        <thead><tr><th>卷号</th><th>分配张数</th><th>卷修订号</th>
+          <th>放行标识</th><th>放行时间</th><th>放行人</th><th>放行/集合快照</th></tr></thead>
+        <tbody>
+          ${s.items.map((it) => `
+            <tr>
+              <td>${esc(it.roll_code)}</td>
+              <td>${it.qty}</td>
+              <td>${it.roll_revision}</td>
+              <td>#${it.release_id == null ? '（已删除）' : it.release_id}</td>
+              <td>${esc(fmtTime(it.release_at))}</td>
+              <td>${esc(it.release_by)}</td>
+              <td>${allergenTags(it.allergens, '无过敏原')}</td>
+            </tr>`).join('')}
+        </tbody>
+      </table>
+      ${s.status === 'PENDING_REVIEW'
+        ? `<div class="shipment-review-reason">⚠ 待评估原因：${esc(s.review_reason || '—')}</div>`
+        : ''}
+    </div>`).join('');
 }
 
 function renderEvents() {
@@ -376,6 +468,7 @@ $('#eventForm').onsubmit = async (e) => {
     await refresh();
     if (r.invalidated && r.invalidated.length) reportInvalidated(r.invalidated);
     if (r.retired_rolls && r.retired_rolls.length) reportRetiredRolls(r.retired_rolls);
+    if (r.pending_shipments && r.pending_shipments.length) reportPendingShipments(r.pending_shipments);
   } catch (err) {
     notice('error', err.error || '提交失败', err.details);
   }
@@ -389,6 +482,7 @@ window.deleteEvent = async function (id) {
     notice('ok', '事件已删除并重算');
     reportInvalidated(r.invalidated);
     reportRetiredRolls(r.retired_rolls);
+    reportPendingShipments(r.pending_shipments);
   } catch (err) { notice('error', err.error || '删除失败', err.details); }
 };
 
@@ -420,6 +514,7 @@ $('#materialForm').onsubmit = async (e) => {
       notice('ok', '原料已更新并重算');
       reportInvalidated(r.invalidated);
       reportRetiredRolls(r.retired_rolls);
+      reportPendingShipments(r.pending_shipments);
     } else {
       await api('/api/materials', { method: 'POST', body });
       await refresh();
@@ -495,12 +590,13 @@ $('#releaseForm').onsubmit = async (e) => {
   } catch (err) { notice('error', err.error || '登记失败', err.details); }
 };
 window.deleteRelease = async (id) => {
-  if (!confirm('删除该放行记录？其名下仍有效的过敏原标签卷将被永久停用（余量冻结、已贴待复核）。')) return;
+  if (!confirm('删除该放行记录？其名下仍有效的过敏原标签卷将被永久停用（余量冻结、已贴待复核），相关已出货单将转为待评估。')) return;
   try {
     const r = await api(`/api/releases/${id}`, { method: 'DELETE' });
     await refresh();
     notice('ok', '放行记录已删除');
     reportRetiredRolls(r.retired_rolls);
+    reportPendingShipments(r.pending_shipments);
   } catch (err) { notice('error', err.error || '删除失败', err.details); }
 };
 
@@ -583,6 +679,95 @@ $('#rollList').addEventListener('submit', async (e) => {
     await refresh(); // 修订号可能已被他人推进，刷新表单
   }
 });
+
+// ================= 包装出货 =================
+function shippableRolls(batchId) {
+  return (state.label_rolls || [])
+    .filter((r) => r.batch_id === batchId && r.active)
+    .filter((r) => {
+      const b = state.batches.find((x) => x.id === batchId);
+      const rel = b && (b.releases || []).find((x) => x.id === r.release_id && x.status === 'ACTIVE');
+      return Boolean(rel);
+    })
+    .filter((r) => r.shippable_qty > 0);
+}
+
+function fillShipmentModal(batchId) {
+  const f = $('#shipmentForm');
+  const batches = state.batches.filter((b) => shippableRolls(b.id).length > 0);
+  $('#shipBatch').innerHTML = batches.length
+    ? batches.map((b) =>
+      `<option value="${b.id}" ${b.id === batchId ? 'selected' : ''}>${esc(b.code)}</option>`).join('')
+    : '';
+  renderShipAllocationRows(batchId || (batches[0] && batches[0].id));
+}
+
+function renderShipAllocationRows(batchId) {
+  const rolls = batchId ? shippableRolls(batchId) : [];
+  if (!rolls.length) {
+    $('#shipRollsHint').innerHTML = '<span class="tag danger">该批次暂无可出货标签（需要未停用、绑定有效放行且有已贴用余额的卷）</span>';
+    $('#shipAllocations').innerHTML = '';
+    return;
+  }
+  $('#shipRollsHint').innerHTML = rolls.map((r) =>
+    `<span class="mini-roll">${esc(r.roll_code)}：已贴 ${r.applied_qty} · 已分配 ${r.allocated_qty || 0} · 可出 <b>${r.shippable_qty}</b>（修订号 ${r.revision}）</span>`
+  ).join(' ');
+  $('#shipAllocations').innerHTML = rolls.map((r) => `
+    <label class="alloc-line">
+      <span class="alloc-roll">${esc(r.roll_code)}</span>
+      <input type="number" min="0" max="${r.shippable_qty}" step="1" value="0"
+             data-roll-id="${r.id}" data-avail="${r.shippable_qty}" class="alloc-qty">
+      <small class="hint">≤ ${r.shippable_qty}</small>
+    </label>`).join('');
+  $('#shipAllocations').querySelectorAll('.alloc-qty').forEach((inp) => {
+    inp.addEventListener('input', syncShipQty);
+  });
+  syncShipQty();
+}
+
+function syncShipQty() {
+  const total = [...$('#shipAllocations').querySelectorAll('.alloc-qty')]
+    .reduce((s, x) => s + (parseInt(x.value, 10) || 0), 0);
+  $('#shipQty').value = total || '';
+}
+
+window.openShipment = function (batchId) {
+  const f = $('#shipmentForm');
+  f.reset();
+  f.shipped_at.value = new Date().toISOString().slice(0, 16);
+  fillShipmentModal(batchId);
+  $('#shipmentModal').classList.remove('hidden');
+};
+$('#btnNewShipment').onclick = () => {
+  const first = state.batches.find((b) => shippableRolls(b.id).length > 0);
+  openShipment(first ? first.id : (state.batches[0] && state.batches[0].id));
+};
+$('#shipBatch').onchange = (e) => {
+  renderShipAllocationRows(parseInt(e.target.value, 10));
+};
+
+$('#shipmentForm').onsubmit = async (e) => {
+  e.preventDefault();
+  const f = e.target;
+  const batch_id = parseInt(f.batch_id.value, 10);
+  const allocations = [...$('#shipAllocations').querySelectorAll('.alloc-qty')]
+    .map((x) => ({ roll_id: parseInt(x.dataset.rollId, 10), qty: parseInt(x.value, 10) || 0 }))
+    .filter((a) => a.qty > 0);
+  const body = {
+    batch_id,
+    ship_qty: parseInt(f.ship_qty.value, 10),
+    shipped_by: f.shipped_by.value,
+    shipped_at: f.shipped_at.value || undefined,
+    allocations
+  };
+  try {
+    const r = await api('/api/shipments', { method: 'POST', body });
+    $('#shipmentModal').classList.add('hidden');
+    $$('.tab').find((x) => x.dataset.tab === 'shipments').click();
+    await refresh();
+    notice('ok', `出货确认成功：单号 ${r.shipment_code}，状态「已出货」，共 ${r.ship_qty} 张`);
+  } catch (err) { notice('error', err.error || '出货被拒绝（整单未占用数量）', err.details); }
+};
 
 // ================= 启动 =================
 refresh().catch((err) => notice('error', '加载状态失败', err.message || String(err)));

@@ -5,7 +5,8 @@
 //         已在残留中的路径原样保留）。
 //   已核实清洗：清空该设备残留。
 // 回放后刷新派生表，并按“登记当时的过敏原集合”核对放行记录，
-// 集合不同的有效放行置为失效并记录原因。
+// 集合不同的有效放行置为失效并记录原因；
+// 进而永久停用不再一致的标签卷，并把分配过这些停用卷的出货单置为待评估。
 
 const MAX_PATHS_PER_ALLERGEN = 30;
 const TRUNC_MARK = '…（来源路径过多，已截断）';
@@ -197,7 +198,11 @@ function recompute(db) {
   const { syncRollsAfterRecompute } = require('./labels');
   const retiredRolls = syncRollsAfterRecompute(db, batchResult);
 
-  return { invalidated, retiredRolls };
+  // ---- 出货单待评估：本次停用的卷若已分配给出货单，则相关单据置为待评估（终态不恢复）----
+  const shipments = require('./shipments');
+  const pendingShipments = shipments.syncPendingShipments(db);
+
+  return { invalidated, retiredRolls, pendingShipments };
 }
 
 module.exports = { recompute, sortedJson };
