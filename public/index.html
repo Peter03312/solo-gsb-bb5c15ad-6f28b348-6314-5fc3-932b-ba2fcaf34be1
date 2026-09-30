@@ -15,6 +15,7 @@
 <nav class="tabs">
   <button class="tab active" data-tab="batches">批次与放行</button>
   <button class="tab" data-tab="labels">过敏原标签卷</button>
+  <button class="tab" data-tab="shipments">包装出货</button>
   <button class="tab" data-tab="events">事件时间线（加工 / 清洗）</button>
   <button class="tab" data-tab="base">原料与设备</button>
 </nav>
@@ -48,6 +49,24 @@
       集合改变或绑定放行失效、删除后该卷<b>永久停用</b>：余量冻结、已贴数量待复核，集合恢复也不自动解冻。
     </p>
     <div id="rollList" class="roll-list"></div>
+  </section>
+
+  <!-- ============ 包装出货视图 ============ -->
+  <section id="tab-shipments" class="tab-panel">
+    <div class="panel-head">
+      <h2>包装出货（按批次分配已贴用标签张数）</h2>
+      <button class="btn primary" id="btnNewShipment">＋ 确认出货</button>
+    </div>
+    <p class="section-hint">
+      出货按<b>批次</b>整单提交：各卷必须属于该批次、<b>未停用且绑定有效放行</b>；
+      各卷分配张数之和必须<b>恰好等于出货量</b>；每卷累计已分配不得超过其<b>已贴用</b>张数（作废张数不可出货）。
+      任一条件不满足则<b>整单拒绝、不占用数量</b>。出货单保存当时的放行标识、过敏原集合、卷号与修订号快照；
+      后续卷停用时相关出货单整单<b>待评估（不自动恢复）</b>，该卷未分配的已贴张数随即冻结。
+    </p>
+    <div class="panel-head"><h3>批次可出货余额</h3></div>
+    <div id="balanceList" class="balance-list"></div>
+    <div class="panel-head" style="margin-top:18px"><h3>出货单</h3></div>
+    <div id="shipmentList" class="shipment-list"></div>
   </section>
 
   <!-- ============ 事件视图 ============ -->
@@ -222,6 +241,44 @@
       <div class="modal-actions">
         <button type="button" class="btn" data-close>取消</button>
         <button type="submit" class="btn primary">登记并返回卷号 / 可用张数</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<!-- ============ 包装出货弹窗 ============ -->
+<div id="shipmentModal" class="modal hidden">
+  <div class="modal-box wide">
+    <h3>确认包装出货</h3>
+    <form id="shipmentForm">
+      <div class="form-row">
+        <label>出货批次 <span class="req">*</span></label>
+        <select name="batch_id" id="shipBatch" required></select>
+      </div>
+      <div class="form-row align-top">
+        <label>该批各卷可出货余额</label>
+        <div id="shipBalance" class="ship-balance"></div>
+      </div>
+      <div class="form-row">
+        <label>出货量（张，正整数）<span class="req">*</span></label>
+        <input type="number" name="ship_qty" id="shipQty" min="1" step="1" required placeholder="如 60">
+      </div>
+      <div class="form-row align-top">
+        <label>各卷分配张数 <span class="req">*</span></label>
+        <div id="shipItems" class="ship-items"></div>
+        <small class="hint">仅可填写未停用、绑定有效放行的卷；每卷一条正整数分配，合计必须恰好等于出货量。</small>
+      </div>
+      <div class="form-row">
+        <label>操作人</label>
+        <input type="text" name="shipped_by" placeholder="姓名/工号">
+      </div>
+      <div class="form-row">
+        <label>&nbsp;</label>
+        <div class="batch-meta">当前分配合计：<b id="shipTotal">0</b> 张（须等于出货量）</div>
+      </div>
+      <div class="modal-actions">
+        <button type="button" class="btn" data-close>取消</button>
+        <button type="submit" class="btn primary">整单确认（任一不满足则整单拒绝）</button>
       </div>
     </form>
   </div>

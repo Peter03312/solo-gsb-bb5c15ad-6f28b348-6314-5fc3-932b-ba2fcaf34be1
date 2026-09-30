@@ -193,11 +193,14 @@ function recompute(db) {
   // 触发条件（任一即永久停用）：
   //   绑定放行已失效/被删除、批次加工不存在、批次当前推导集合与卷的拟印集合不同
   //   （原料/加工事件变更、整组确认应用使集合改变等均经此路径生效）。
+  // 实际停用的卷同步把相关已确认出货单整单标记为待评估（同样终态、不自动恢复）。
   // 延迟 require 以避免 labels <-> recompute 循环依赖。
   const { syncRollsAfterRecompute } = require('./labels');
-  const retiredRolls = syncRollsAfterRecompute(db, batchResult);
+  const syncResult = syncRollsAfterRecompute(db, batchResult);
+  const retiredRolls = syncResult.retired;
+  const pendingShipments = syncResult.pending_shipments;
 
-  return { invalidated, retiredRolls };
+  return { invalidated, retiredRolls, pendingShipments };
 }
 
 module.exports = { recompute, sortedJson };

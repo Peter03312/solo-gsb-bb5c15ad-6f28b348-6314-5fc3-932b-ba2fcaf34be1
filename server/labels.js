@@ -169,18 +169,38 @@ function consumeRoll(db, id, body) {
 }
 
 // ---------- 终态停用 ----------
-function deactivateRolls(db, ids, reason) {
-  const list = Array.isArray(ids) ? ids : [ids];
-  const stmt = db.prepare(
-    `UPDATE label_rolls SET status = 'RETIRED', retired_reason = ?
-      WHERE id = ? AND status = 'ACTIVE'`
-  );
-  let count = 0;
+// entries: [{ id, reason }]（同一原因可传 [{id},{id}...] 由 reason 参数兜底）。
+// 仅停用仍为 ACTIVE 的卷；停用后同步把“使用了这些卷的已确认出货单”整单标记为待评估。
+// 返回 { retired: [{id, roll_code, batch_code, reason, applied_pending_review}],
+//        pending_shipments: [...] }。
+function deactivateRolls(db, entries, fallbackReason) {
+  const list = (Array.isArray(entries) ? entries : [entries]).map((e) =>
+    typeof e === 'object' ? { id: e.id, reason: e.reason || fallbackReason } : { id: e, reason: fallbackReason });
+  let result = { retired: [], pending_shipments: [] };
   const tx = db.transaction(() => {
-    for (const id of list) count += stmt.run(reason, id).changes;
+    const retiredRows = [];
+    for (const { id, reason } of list) {
+      const before = db.prepare('SELECT * FROM label_rolls WHERE id = ?').get(id);
+      if (!before || before.status !== 'ACTIVE') continue;
+      db.prepare(
+        `UPDATE label_rolls SET status = 'RETIRED', retired_reason = ?
+          WHERE id = ? AND status = 'ACTIVE'`
+      ).run(reason, id);
+      const row = db.prepare(
+        `SELECT lr.id, lr.roll_code, lr.batch_id, b.code AS batch_code, lr.applied_qty
+           FROM label_rolls lr LEFT JOIN batches b ON b.id = lr.batch_id
+          WHERE lr.id = ?`
+      ).get(id);
+      retiredRows.push({
+        id: row.id, roll_code: row.roll_code, batch_code: row.batch_code || null,
+        reason, applied_pending_review: row.applied_qty
+      });
+    }
+    const pending = require('./shipments').markShipmentsForRetiredRolls(db, retiredRows);
+    result = { retired: retiredRows, pending_shipments: pending };
   });
   tx();
-  return count;
+  return result;
 }
 
 // 放行被删除：其名下所有有效卷永久停用（放行已不存在，无法再保持一致）。
@@ -194,8 +214,10 @@ function deactivateForReleaseDeletion(db, releaseId) {
   const rolls = db.prepare(
     "SELECT id, roll_code FROM label_rolls WHERE release_id = ? AND status = 'ACTIVE'"
   ).all(releaseId);
-  const count = deactivateRolls(db, rolls.map((r) => r.id), reason);
-  return { count, reason, rolls };
+  const { retired, pending_shipments } = deactivateRolls(
+    db, rolls.map((r) => ({ id: r.id, reason }))
+  );
+  return { count: retired.length, reason, rolls: retired, pending_shipments };
 }
 
 // 加工事件删除致批次连带删除的兜底：该批次剩余有效卷永久停用。
@@ -204,12 +226,15 @@ function deactivateForBatchDeletion(db, batchId, batchCode) {
   const rolls = db.prepare(
     "SELECT id, roll_code FROM label_rolls WHERE batch_id = ? AND status = 'ACTIVE'"
   ).all(batchId);
-  const count = deactivateRolls(db, rolls.map((r) => r.id), reason);
-  return { count, reason, rolls };
+  const { retired, pending_shipments } = deactivateRolls(
+    db, rolls.map((r) => ({ id: r.id, reason }))
+  );
+  return { count: retired.length, reason, rolls: retired, pending_shipments };
 }
 
 // 重算后核对：对所有仍有效的卷检查“绑定放行 / 批次 / 集合”是否仍一致。
 // 只在重算事务内调用；停用为终态，不做任何“解冻”。
+// 本次实际停用的卷会同步把相关已确认出货单标记为待评估。
 function syncRollsAfterRecompute(db, batchResult) {
   const rollRows = db.prepare(
     `SELECT lr.id, lr.roll_code, lr.batch_id, lr.release_id, lr.allergen_set,
@@ -217,10 +242,7 @@ function syncRollsAfterRecompute(db, batchResult) {
        FROM label_rolls lr LEFT JOIN batches b ON b.id = lr.batch_id
       WHERE lr.status = 'ACTIVE'`
   ).all();
-  const upd = db.prepare(
-    `UPDATE label_rolls SET status = 'RETIRED', retired_reason = ? WHERE id = ?`
-  );
-  const retired = [];
+  const toRetire = [];
   for (const roll of rollRows) {
     let reason = null;
 
@@ -252,18 +274,30 @@ function syncRollsAfterRecompute(db, batchResult) {
       }
     }
 
-    if (reason) {
-      upd.run(reason, roll.id);
-      retired.push({
-        id: roll.id, roll_code: roll.roll_code,
-        batch_code: roll.batch_code || null, reason,
-        applied_pending_review: db.prepare(
-          'SELECT applied_qty FROM label_rolls WHERE id = ?'
-        ).get(roll.id).applied_qty
-      });
-    }
+    if (reason) toRetire.push({ id: roll.id, roll_code: roll.roll_code, batch_code: roll.batch_code || null, reason });
   }
-  return retired;
+
+  const upd = db.prepare(
+    `UPDATE label_rolls SET status = 'RETIRED', retired_reason = ? WHERE id = ? AND status = 'ACTIVE'`
+  );
+  const retired = [];
+  for (const r of toRetire) {
+    upd.run(r.reason, r.id);
+    // 停用以 UPDATE 实际生效为准（批量场景下避免重复计入）。
+    const q = db.prepare(
+      `SELECT lr.id, lr.roll_code, b.code AS batch_code, lr.applied_qty
+         FROM label_rolls lr LEFT JOIN batches b ON b.id = lr.batch_id
+        WHERE lr.id = ? AND lr.status = 'RETIRED'`
+    ).get(r.id);
+    if (!q) continue;
+    retired.push({
+      id: q.id, roll_code: q.roll_code, batch_code: q.batch_code || null,
+      reason: r.reason, applied_pending_review: q.applied_qty
+    });
+  }
+  // 延迟 require 以避免 labels <-> shipments 循环依赖。
+  const pending_shipments = require('./shipments').markShipmentsForRetiredRolls(db, retired);
+  return { retired, pending_shipments };
 }
 
 // ---------- 读取模型 ----------

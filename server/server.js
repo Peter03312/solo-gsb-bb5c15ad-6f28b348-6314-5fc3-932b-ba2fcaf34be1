@@ -7,6 +7,7 @@ const { recompute, sortedJson } = require('./recompute');
 const { seedIfEmpty } = require('./seed');
 const replan = require('./replan');
 const labels = require('./labels');
+const shipments = require('./shipments');
 
 const PORT = parseInt(process.env.PORT || '3000', 10);
 const HOST = process.env.HOST || '0.0.0.0';
@@ -123,7 +124,12 @@ app.get('/api/state', (req, res) => {
     release_by: r.release_by
   }));
 
-  res.json({ materials, equipment, events, batches, label_rolls });
+  const shipment_rows = db.prepare(
+    'SELECT id FROM shipments ORDER BY shipped_at DESC, id DESC'
+  ).all();
+  const shipment_list = shipment_rows.map((row) => shipments.getShipment(db, row.id));
+
+  res.json({ materials, equipment, events, batches, label_rolls, shipments: shipment_list });
 });
 
 // ---------- 通用：在事务中写事件集 -> 校验 -> 重算 ----------
@@ -141,7 +147,8 @@ function mutateEvents(fn) {
     return {
       ret,
       invalidated: recomputeResult.invalidated,
-      retired_rolls: recomputeResult.retiredRolls
+      retired_rolls: recomputeResult.retiredRolls,
+      pending_shipments: recomputeResult.pendingShipments
     };
   })();
   return result;
@@ -173,8 +180,8 @@ app.put('/api/materials/:id', (req, res) => {
     ).run(code, name, JSON.stringify(allergens), req.params.id);
     if (!info.changes) return res.status(404).json({ error: '原料不存在' });
     // 过敏原被修改会改变批次推导结果，需要全量重算
-    const { invalidated, retired_rolls } = mutateEvents(() => {});
-    res.json({ ok: true, invalidated, retired_rolls });
+    const { invalidated, retired_rolls, pending_shipments } = mutateEvents(() => {});
+    res.json({ ok: true, invalidated, retired_rolls, pending_shipments });
   } catch (err) { badRequest(res, err); }
 });
 
@@ -248,7 +255,7 @@ function normalizeEquipment(body) {
 app.post('/api/events', (req, res) => {
   try {
     const body = normalizeEventBody(req.body);
-    const { ret, invalidated, retired_rolls } = mutateEvents((d) => {
+    const { ret, invalidated, retired_rolls, pending_shipments } = mutateEvents((d) => {
       let batchId = null;
       if (body.type === 'PROCESS') {
         batchId = d.prepare('INSERT INTO batches (code) VALUES (?)')
@@ -269,7 +276,7 @@ app.post('/api/events', (req, res) => {
       }
       return eid;
     });
-    res.json({ id: ret, invalidated, retired_rolls });
+    res.json({ id: ret, invalidated, retired_rolls, pending_shipments });
   } catch (err) { badRequest(res, err); }
 });
 
@@ -282,7 +289,7 @@ app.put('/api/events/:id', (req, res) => {
     if (body.type !== existing.type) {
       return res.status(400).json({ error: '事件类型（加工/清洗）不可变更，请删除后新建' });
     }
-    const { invalidated, retired_rolls } = mutateEvents((d) => {
+    const { invalidated, retired_rolls, pending_shipments } = mutateEvents((d) => {
       if (body.type === 'PROCESS') {
         d.prepare('UPDATE batches SET code=? WHERE id=?')
           .run(body.batch_code, existing.batch_id);
@@ -300,7 +307,7 @@ app.put('/api/events/:id', (req, res) => {
         'UPDATE events SET event_time=?, equipment_id=?, note=? WHERE id=?'
       ).run(body.event_time, body.equipment_id, body.note, existing.id);
     });
-    res.json({ ok: true, invalidated, retired_rolls });
+    res.json({ ok: true, invalidated, retired_rolls, pending_shipments });
   } catch (err) { badRequest(res, err); }
 });
 
@@ -310,7 +317,7 @@ app.delete('/api/events/:id', (req, res) => {
       'SELECT ev.id, ev.type, ev.batch_id, b.code AS batch_code FROM events ev LEFT JOIN batches b ON b.id = ev.batch_id WHERE ev.id=?'
     ).get(req.params.id);
     if (!existing) return res.status(404).json({ error: '事件不存在' });
-    const { invalidated, retired_rolls } = mutateEvents((d) => {
+    const { invalidated, retired_rolls, pending_shipments } = mutateEvents((d) => {
       if (existing.type === 'PROCESS' && existing.batch_id) {
         const referenced = d.prepare(
           'SELECT COUNT(*) AS c FROM process_inputs WHERE batch_id=?'
@@ -324,6 +331,12 @@ app.delete('/api/events/:id', (req, res) => {
         if (hasRelease) {
           throw new Error('该批次已有放行记录，请先删除相关放行记录后再删除加工事件');
         }
+        const hasShipment = d.prepare(
+          'SELECT COUNT(*) AS c FROM shipments WHERE batch_id=?'
+        ).get(existing.batch_id).c;
+        if (hasShipment) {
+          throw new Error('该批次已有出货记录，出货留痕不可删除，不能删除其加工事件');
+        }
         // 兜底：批次连带删除时，其名下仍有效的标签卷永久停用（通常不会走到，因放行需先删）
         labels.deactivateForBatchDeletion(d, existing.batch_id, existing.batch_code);
         d.prepare('DELETE FROM batch_outputs WHERE batch_id=?').run(existing.batch_id);
@@ -331,7 +344,7 @@ app.delete('/api/events/:id', (req, res) => {
       }
       d.prepare('DELETE FROM events WHERE id=?').run(existing.id);
     });
-    res.json({ ok: true, invalidated, retired_rolls });
+    res.json({ ok: true, invalidated, retired_rolls, pending_shipments });
   } catch (err) { badRequest(res, err); }
 });
 
@@ -389,12 +402,14 @@ app.post('/api/releases', (req, res) => {
 app.delete('/api/releases/:id', (req, res) => {
   const rel = db.prepare('SELECT id FROM releases WHERE id=?').get(req.params.id);
   if (!rel) return res.status(404).json({ error: '放行记录不存在' });
-  // 放行删除：其名下仍有效的标签卷先永久停用（字段/响应形状保持 ok:true 不变，附加 retired_rolls）
-  const { rolls, reason } = labels.deactivateForReleaseDeletion(db, rel.id);
+  // 放行删除：其名下仍有效的标签卷先永久停用（字段/响应形状保持 ok:true 不变，附加 retired_rolls），
+  // 使用了被停用卷的已确认出货单整单标记待评估（附加 pending_shipments）。
+  const { rolls, reason, pending_shipments } = labels.deactivateForReleaseDeletion(db, rel.id);
   db.prepare('DELETE FROM releases WHERE id=?').run(rel.id);
   res.json({
     ok: true,
-    retired_rolls: rolls.map((x) => ({ id: x.id, roll_code: x.roll_code, reason }))
+    retired_rolls: rolls.map((x) => ({ id: x.id, roll_code: x.roll_code, reason })),
+    pending_shipments
   });
 });
 
@@ -422,6 +437,63 @@ function sendLabelError(res, err) {
     const status = (err.code === 'REVISION_MISMATCH' || err.code === 'OVER_LIMIT' ||
       err.code === 'ROLL_RETIRED') ? 409 : 400;
     if (err.code === 'ROLL_NOT_FOUND') return res.status(404).json({ error: err.message, code: err.code });
+    return res.status(status).json({
+      error: err.message,
+      code: err.code,
+      details: err.details
+    });
+  }
+  console.error(err);
+  return res.status(500).json({ error: err && err.message ? err.message : '服务器内部错误' });
+}
+
+// ---------- 包装出货 ----------
+// 确认出货：body { batch_id, ship_qty, items:[{roll_id, alloc_qty}], shipped_by?, shipped_at? }
+// 整单事务化：任一卷不满足（不属于该批/已停用/无有效放行/累计超已贴用）或分配总数≠出货量，
+// 整单拒绝（回滚，不占用任何数量）。成功返回出货单号与状态。
+app.post('/api/shipments', (req, res) => {
+  try {
+    res.json(shipments.createShipment(db, req.body || {}));
+  } catch (err) { sendShipmentError(res, err); }
+});
+
+// 出货单状态：可按批次 / 状态过滤；不带条件返回全部。
+app.get('/api/shipments', (req, res) => {
+  try {
+    const filter = {};
+    if (req.query.batch_id !== undefined) filter.batch_id = req.query.batch_id;
+    if (req.query.status !== undefined) filter.status = req.query.status;
+    res.json(shipments.listShipments(db, filter));
+  } catch (err) { sendShipmentError(res, err); }
+});
+
+app.get('/api/shipments/:id', (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  if (!Number.isInteger(id)) {
+    return res.status(400).json({ error: '出货单号不合法', code: 'INVALID_REQUEST' });
+  }
+  const s = shipments.getShipment(db, id);
+  if (!s) return res.status(404).json({ error: '出货单不存在', code: 'SHIPMENT_NOT_FOUND' });
+  res.json(s);
+});
+
+// 批次可出货余额：/api/batches/shipment-balance（全部批次）；?batch_id= 或 /api/batches/:id/shipment-balance 单批。
+app.get(['/api/batches/shipment-balance', '/api/batches/:id/shipment-balance'], (req, res) => {
+  try {
+    const raw = req.params.id !== undefined ? req.params.id
+      : (req.query.batch_id !== undefined ? req.query.batch_id : undefined);
+    if (raw === undefined) return res.json(shipments.listBatchBalances(db));
+    const batch_id = parseInt(raw, 10);
+    if (!Number.isInteger(batch_id)) {
+      return res.status(400).json({ error: '批次号不合法', code: 'INVALID_REQUEST' });
+    }
+    res.json(shipments.getBatchBalance(db, batch_id));
+  } catch (err) { sendShipmentError(res, err); }
+});
+
+function sendShipmentError(res, err) {
+  if (err && err.name === 'ShipmentError') {
+    const status = shipments.ERROR_STATUS[err.code] || 400;
     return res.status(status).json({
       error: err.message,
       code: err.code,

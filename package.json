@@ -8,10 +8,11 @@
     "init-db": "node -e \"require('./server/db').initDbFile()\"",
     "test": "node scripts/test-cycle.js",
     "test:replan": "node scripts/test-replan.js",
-    "test:labels": "node scripts/test-labels.js"
+    "test:labels": "node scripts/test-labels.js",
+    "test:shipments": "node scripts/test-shipments.js"
   },
   "dependencies": {
-    "better-sqlite3": "^11.8.1",
+    "better-sqlite3": "^11.10.0",
     "express": "^4.21.2"
   }
 }

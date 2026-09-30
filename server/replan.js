@@ -258,7 +258,16 @@ const FINGERPRINT_SQL = [
   'SELECT id, code FROM batches ORDER BY id',
   'SELECT id, event_id, material_id, batch_id FROM process_inputs ORDER BY id',
   `SELECT id, batch_id, released_at, released_by, snapshot_allergens, status,
-          invalid_reason, created_event_seq FROM releases ORDER BY id`
+          invalid_reason, created_event_seq FROM releases ORDER BY id`,
+  `SELECT id, roll_code, batch_id, release_id, print_qty, applied_qty, void_qty,
+          revision, allergen_set, status, retired_reason FROM label_rolls ORDER BY id`,
+  // 出货记录会被卷停用联动标记待评估，且会影响后续可出货余额：纳入指纹，
+  // 预演后任何出货写入同样使旧版本过期。
+  `SELECT id, shipment_code, batch_id, batch_code_snapshot, ship_qty, status,
+          review_reason, reviewed_rolls_json FROM shipments ORDER BY id`,
+  `SELECT id, shipment_id, roll_id, roll_code_snapshot, batch_id_snapshot,
+          release_id_snapshot, allergens_snapshot, roll_revision_snapshot, alloc_qty
+     FROM shipment_items ORDER BY id`
 ];
 function stateFingerprint(db) {
   const h = crypto.createHash('sha256');
@@ -501,6 +510,8 @@ function openShadow(sourceDb) {
   copy('releases', 'id,batch_id,released_at,released_by,snapshot_allergens,status,invalid_reason,created_event_seq');
   copy('label_rolls', 'id,roll_code,batch_id,release_id,print_qty,applied_qty,void_qty,revision,allergen_set,registered_at,registered_by,status,retired_reason');
   copy('label_roll_usages', 'id,roll_id,used_at,applied_qty,void_qty,expected_revision,used_by');
+  copy('shipments', 'id,shipment_code,batch_id,batch_code_snapshot,ship_qty,status,review_reason,reviewed_rolls_json,shipped_at,shipped_by,created_event_seq');
+  copy('shipment_items', 'id,shipment_id,roll_id,roll_code_snapshot,batch_id_snapshot,release_id_snapshot,allergens_snapshot,roll_revision_snapshot,alloc_qty');
   shadow.pragma('foreign_keys = ON');
   return shadow;
 }
@@ -533,9 +544,25 @@ function simulate(db, changes) {
         roll_id: r.id, roll_code: r.roll_code, batch_code: r.batch_code,
         reason: r.retired_reason, applied_pending_review: r.applied_qty
       }));
+    // 影子库中“正式库原为 CONFIRMED、重算后变为 PENDING_REVIEW”的出货单
+    const confirmedRealIds = new Set(db.prepare(
+      "SELECT id FROM shipments WHERE status = 'CONFIRMED'"
+    ).all().map((r) => r.id));
+    const pendingShipments = shadow.prepare(
+      `SELECT id, shipment_code, batch_id, batch_code_snapshot, review_reason
+         FROM shipments WHERE status = 'PENDING_REVIEW'`
+    ).all()
+      .filter((s) => confirmedRealIds.has(s.id))
+      .map((s) => ({
+        shipment_id: s.id, shipment_code: s.shipment_code,
+        batch_id: s.batch_id, batch_code: s.batch_code_snapshot,
+        reason: s.review_reason
+      }));
     const diff = diffSnapshots(before, after);
     diff.label_rolls_will_retire = retiredRolls;
     diff.summary.label_rolls_will_retire = retiredRolls.length;
+    diff.shipments_will_pending_review = pendingShipments;
+    diff.summary.shipments_will_pending_review = pendingShipments.length;
     return { resolved, inserted, after, diff };
   } finally {
     shadow.close();
@@ -597,7 +624,7 @@ function apply(db, body) {
     if (errors.length) {
       throw new ReplanError('REPLAN_REJECTED', '整组变更应用后的时间线校验未通过', errors);
     }
-    const { invalidated, retiredRolls } = recompute(db);
+    const { invalidated, retiredRolls, pendingShipments } = recompute(db);
     const after = takeSnapshot(db);
     const appliedDiff = diffSnapshots(before, after);
     appliedDiff.label_rolls_will_retire = retiredRolls.map((r) => ({
@@ -605,6 +632,11 @@ function apply(db, body) {
       reason: r.reason, applied_pending_review: r.applied_pending_review
     }));
     appliedDiff.summary.label_rolls_will_retire = retiredRolls.length;
+    appliedDiff.shipments_will_pending_review = pendingShipments.map((s) => ({
+      shipment_id: s.id, shipment_code: s.shipment_code,
+      batch_id: s.batch_id, batch_code: s.batch_code, reason: s.reason
+    }));
+    appliedDiff.summary.shipments_will_pending_review = pendingShipments.length;
 
     // 提交后再计算一次指纹，作为新的业务版本随结果返回。
     response = {
@@ -614,6 +646,7 @@ function apply(db, body) {
       inserted_clean_events: inserted,
       invalidated,
       retired_rolls: retiredRolls,
+      pending_shipments: pendingShipments,
       diff: appliedDiff
     };
   });
